@@ -4,7 +4,9 @@ import cpw.mods.jarhandling.JarContents;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.*;
-import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
 import java.util.zip.*;
 
 /**
@@ -22,7 +24,10 @@ public class OverlappingJarResolver20x {
      * Returns the {@link JarContents} to load for the given jar.
      *
      * <p>Returns the outer jar as-is unless it has JarJar metadata and an inner jar with the
-     * same mod ID, in which case the inner jar is extracted to the cache and returned directly.
+     * same mod ID, in which case the inner jar is extracted to the cache and a union of the
+     * inner jar plus a patched copy of the outer jar (with its own {@code neoforge.mods.toml},
+     * {@code MANIFEST.MF}, and the self-referential JarJar entry stripped) is returned, so the
+     * outer jar's other classes are still available on the classpath.
      *
      * @param jarPath    path to the outer mod jar
      * @param coordLabel Maven coordinate, used only in log output
@@ -40,7 +45,7 @@ public class OverlappingJarResolver20x {
 
             String metadata;
             try (InputStream in = zip.getInputStream(zip.getEntry("META-INF/jarjar/metadata.json"))) {
-                metadata = new String(in.readAllBytes());
+                metadata = new String(in.readAllBytes(), StandardCharsets.UTF_8);
             }
 
             String innerEntryPath = findInnerJarWithSameModId(zip, metadata, outerModId);
@@ -49,12 +54,107 @@ public class OverlappingJarResolver20x {
 
             String filename = innerEntryPath.substring(innerEntryPath.lastIndexOf('/') + 1);
             Path innerJar = jijCache.extract(zip, innerEntryPath, filename);
+            Path patchedOuter = createPatchedJar(zip, jarPath, innerEntryPath, metadata);
 
-            System.out.println("[Mercator] Using inner jar for: " + coordLabel);
-            // securejarhandler 3.x has no path filter, use the inner jar directly to avoid
-            // duplicate-modId conflicts caused by the outer jar's jarjar metadata.
-            return JarContents.of(innerJar);
+            System.out.println("[Mercator] Using JarContents for: " + coordLabel);
+            return JarContents.of(List.of(innerJar, patchedOuter));
         }
+    }
+
+    /**
+     * Creates a patched copy of the outer jar with the self-referential entry removed from
+     * {@code META-INF/jarjar/} (both the jar file entry and its {@code metadata.json} record),
+     * and with {@code META-INF/neoforge.mods.toml} / {@code META-INF/MANIFEST.MF} dropped so the
+     * inner jar's copies are the only ones seen. The result is cached next to the original as
+     * {@code <name>.patched.jar}.
+     */
+    private Path createPatchedJar(ZipFile zip, Path jarPath, String innerEntryPath, String originalMetadata)
+            throws IOException {
+        String patchedName = jarPath.getFileName().toString().replace(".jar", ".patched.jar");
+        Path patchedPath = jarPath.getParent().resolve(patchedName);
+
+        if (Files.isRegularFile(patchedPath)) return patchedPath;
+
+        String patchedMetadata = removePathFromMetadata(originalMetadata, innerEntryPath);
+
+        Path tmp = Files.createTempFile(jarPath.getParent(), "_patched", ".tmp");
+        try (ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(tmp))) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if (name.equals(innerEntryPath)
+                        || name.equals("META-INF/neoforge.mods.toml")
+                        || name.equals("META-INF/MANIFEST.MF")) continue;
+                out.putNextEntry(new ZipEntry(name));
+                if (name.equals("META-INF/jarjar/metadata.json")) {
+                    out.write(patchedMetadata.getBytes(StandardCharsets.UTF_8));
+                } else {
+                    try (InputStream in = zip.getInputStream(entry)) {
+                        in.transferTo(out);
+                    }
+                }
+                out.closeEntry();
+            }
+        } catch (Exception e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+
+        try {
+            Files.move(tmp, patchedPath, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, patchedPath, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return patchedPath;
+    }
+
+    /**
+     * Removes the JSON object for {@code pathToRemove} from the {@code jars} array in the
+     * JarJar {@code metadata.json} string.
+     *
+     * <p>Scans backwards from the {@code "path"} key to find the outermost {@code {} enclosing
+     * the entry (not an inner nested one), then forward to its matching {@code }}, and splices
+     * out the object along with any surrounding comma.
+     */
+    private String removePathFromMetadata(String metadata, String pathToRemove) {
+        String pathKey = "\"path\": \"" + pathToRemove + "\"";
+        int pathIdx = metadata.indexOf(pathKey);
+        if (pathIdx == -1) return metadata;
+
+        int depth = 0, blockStart = -1;
+        for (int i = pathIdx - 1; i >= 0; i--) {
+            char c = metadata.charAt(i);
+            if (c == '}') depth++;
+            else if (c == '{') {
+                if (depth == 0) { blockStart = i; break; }
+                depth--;
+            }
+        }
+        if (blockStart == -1) return metadata;
+
+        depth = 0;
+        int blockEnd = -1;
+        for (int i = blockStart; i < metadata.length(); i++) {
+            char c = metadata.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') {
+                if (--depth == 0) { blockEnd = i + 1; break; }
+            }
+        }
+        if (blockEnd == -1) return metadata;
+
+        String before = metadata.substring(0, blockStart).stripTrailing();
+        String after  = metadata.substring(blockEnd).stripLeading();
+
+        boolean beforeComma = before.endsWith(",");
+        boolean afterComma  = after.startsWith(",");
+
+        if (beforeComma) before = before.substring(0, before.length() - 1).stripTrailing();
+        if (afterComma)  after  = after.substring(1).stripLeading();
+
+        if (beforeComma && afterComma) return before + "," + after;
+        return before + after;
     }
 
     /**

@@ -40,13 +40,6 @@ public record MavenCoordinate(String group, String artifact, String version) {
                 .resolve(artifact)
                 .resolve(version);
 
-        if (version.contains("+")) {
-            System.out.println("[Mercator] Checking for patched jar for: " + this);
-            Path patched = base.resolve(artifact + "-" + version + ".patched.jar").normalize();
-            System.out.println("[Mercator] Patched jar path: " + patched);
-            if (Files.exists(patched)) return patched;
-        }
-
         return base.resolve(artifact + "-" + version + ".jar").normalize();
     }
 

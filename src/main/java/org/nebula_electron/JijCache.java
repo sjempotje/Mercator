@@ -22,6 +22,11 @@ public class JijCache {
      */
     public JijCache(Path cacheDir) {
         this.cacheDir = cacheDir;
+        try {
+            Files.createDirectories(cacheDir);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create JijCache directory: " + cacheDir, e);
+        }
     }
 
     /**
